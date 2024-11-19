@@ -1,3 +1,6 @@
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
@@ -11,6 +14,33 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = FastAPI(title="Amazon Price Alert API")
+
+class EmailNotifier:
+    def __init__(self):
+        self.smtp_server = "smtp.gmail.com"
+        self.smtp_port = 587
+        self.sender_email = os.getenv('GMAIL_USER')
+        self.password = os.getenv('GMAIL_APP_PASSWORD')
+
+    def send_email(self, recipient, subject, message):
+        try:
+            msg = MIMEMultipart()
+            msg['From'] = self.sender_email
+            msg['To'] = recipient
+            msg['Subject'] = subject
+
+            msg.attach(MIMEText(message, 'plain'))
+
+            server = smtplib.SMTP(self.smtp_server, self.smtp_port)
+            server.starttls()
+            server.login(self.sender_email, self.password)
+            server.send_message(msg)
+            server.quit()
+            print(f"Email envoyé avec succès à {recipient}")
+            return True
+        except Exception as e:
+            print(f"Erreur d'envoi d'email: {str(e)}")
+            return False
 
 class PriceAlert(BaseModel):
     product_name: str
@@ -29,10 +59,11 @@ class ProductPrice(BaseModel):
 def get_db_connection():
     """Crée une connexion à la base de données PostgreSQL"""
     try:
-        conn = psycopg2.connect(
-            os.environ.get('DATABASE_URL'),
-            cursor_factory=RealDictCursor
-        )
+        DATABASE_URL = os.environ.get('DATABASE_URL')
+        if DATABASE_URL and DATABASE_URL.startswith('postgres://'):
+            DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
+        
+        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
         return conn
     except Exception as e:
         print(f"Erreur de connexion à la base de données: {e}")
@@ -91,6 +122,18 @@ async def create_alert(alert: PriceAlert):
             ))
             alert_id = cursor.fetchone()['id']
             conn.commit()
+
+            # Envoyer un email de confirmation si une adresse email est fournie
+            if alert.email:
+                email_notifier = EmailNotifier()
+                subject = "Nouvelle alerte de prix créée"
+                message = (
+                    f"Une nouvelle alerte de prix a été créée pour {alert.product_name}\n\n"
+                    f"Prix cible: {alert.target_price}€\n"
+                    f"Notification si prix {'supérieur' if alert.notify_above else 'inférieur'}\n"
+                )
+                email_notifier.send_email(alert.email, subject, message)
+
             return {
                 "status": "success",
                 "message": "Alerte créée avec succès",
@@ -117,13 +160,26 @@ async def delete_alert(alert_id: int):
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
+            # Récupérer l'alerte avant de la désactiver
+            cursor.execute('SELECT * FROM price_alerts WHERE id = %s', (alert_id,))
+            alert = cursor.fetchone()
+            
+            if not alert:
+                raise HTTPException(status_code=404, detail="Alerte non trouvée")
+            
             cursor.execute(
                 'UPDATE price_alerts SET is_active = FALSE WHERE id = %s',
                 (alert_id,)
             )
-            if cursor.rowcount == 0:
-                raise HTTPException(status_code=404, detail="Alerte non trouvée")
             conn.commit()
+
+            # Envoyer un email de confirmation si une adresse email existe
+            if alert['email']:
+                email_notifier = EmailNotifier()
+                subject = "Alerte de prix désactivée"
+                message = f"L'alerte de prix pour {alert['product_name']} a été désactivée."
+                email_notifier.send_email(alert['email'], subject, message)
+
             return {"status": "success", "message": "Alerte désactivée"}
     finally:
         conn.close()
@@ -132,6 +188,8 @@ async def delete_alert(alert_id: int):
 async def check_prices(prices: List[ProductPrice]):
     """Vérifie les prix actuels par rapport aux alertes"""
     conn = get_db_connection()
+    email_notifier = EmailNotifier()
+    
     try:
         with conn.cursor() as cursor:
             cursor.execute('SELECT * FROM price_alerts WHERE is_active = TRUE')
@@ -146,13 +204,25 @@ async def check_prices(prices: List[ProductPrice]):
                             (alert['notify_below'] and price.current_price < alert['target_price'])
                         )
                         if should_notify:
-                            triggered_alerts.append({
+                            alert_info = {
                                 "alert_id": alert['id'],
                                 "product_name": price.name,
                                 "current_price": price.current_price,
                                 "target_price": alert['target_price']
-                            })
+                            }
+                            triggered_alerts.append(alert_info)
                             
+                            if alert['email']:
+                                subject = f"Alerte Prix - {price.name}"
+                                message = (
+                                    f"Le prix de {price.name} a changé!\n\n"
+                                    f"Prix actuel: {price.current_price}€\n"
+                                    f"Prix cible: {alert['target_price']}€\n"
+                                    f"Type d'alerte: {'Prix supérieur' if alert['notify_above'] else 'Prix inférieur'}\n\n"
+                                    f"Voir le produit: {price.url}"
+                                )
+                                email_notifier.send_email(alert['email'], subject, message)
+
                             cursor.execute('''
                                 UPDATE price_alerts 
                                 SET last_notification = NOW() 
